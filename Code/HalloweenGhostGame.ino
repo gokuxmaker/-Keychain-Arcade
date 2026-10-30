@@ -1,12 +1,14 @@
 /*
   =============================================================================
   KEYCHAIN ARCADE - Halloween 2-in-1 Retro System
-  Board:       Seeed Studio XIAO nRF52840 (or XIAO nRF52840 Plus)
+  Supported Boards:
+    - Seeed Studio XIAO ESP32-S3 / XIAO ESP32-S3 Plus
+    - Seeed Studio XIAO nRF52840 / XIAO nRF52840 Plus
   Display:     0.96" IPS ST7789 TFT (80x160 resolution, landscape 160x80)
   Driver:      Seeed_GFX2 with Full Double-Buffering & Fast DMA Stream
   Theme:       Halloween Retro Edition (Full-Screen Sunset & Dark Graveyard)
   Buttons:     D6 (BTN_USR1) / D7 (BTN_USR2)
-  Storage:     InternalFS (LittleFS) non-volatile Save Data
+  Storage:     NVS Preferences (ESP32-S3) / LittleFS (nRF52840)
 
   GAMES INCLUDED:
     1. GOST RUN    - Full-Screen Cute Ghost Endless Runner (Sunset Sky, No Black Bars!)
@@ -16,18 +18,23 @@
 */
 
 #include <Arduino.h>
-#include <Adafruit_TinyUSB.h>
-#include <Adafruit_LittleFS.h>
-#include <InternalFileSystem.h>
 #include <Seeed_GFX.h>
 #include "board/boards/XIAO_LCD_Board.h"
 #include "driver/tft/Driver_ST7789.h"
 #include "panel/Panel_TFT.h"
-#include <nrf.h>
-#include <nrf_gpio.h>
 #include "PongBg.h"
 
-using namespace Adafruit_LittleFS_Namespace;
+// ── Architecture Specific Headers ──────────────────────────────────────────
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  #include <Preferences.h>
+#else
+  #include <Adafruit_TinyUSB.h>
+  #include <Adafruit_LittleFS.h>
+  #include <InternalFileSystem.h>
+  #include <nrf.h>
+  #include <nrf_gpio.h>
+  using namespace Adafruit_LittleFS_Namespace;
+#endif
 
 // =============================================================================
 // ── USER GAMEPLAY CONFIGURATION ──────────────────────────────────────────────
@@ -49,18 +56,26 @@ static constexpr float CONFIG_PONG_PADDLE_SPEED  = 2.8f;
 #define SCREEN_ROTATION 3
 #endif
 
-// ── Pin Definitions ────────────────────────────────────────────────────────
-static constexpr int8_t LCD_RST_PIN   = 38;  // Display Reset (raw GPIO on Plus)
-static constexpr int8_t LCD_BL_PIN    = 37;  // Display Backlight (raw GPIO)
+// ── Hardware Pin Definitions ───────────────────────────────────────────────
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  // XIAO ESP32-S3 / Plus pin mapping
+  static constexpr int8_t LCD_RST_PIN   = 13;   // Display Reset
+  static constexpr int8_t LCD_BL_PIN    = 12;   // Display Backlight
+  static constexpr uint8_t PIN_BAT_ADC  = D16;  // Onboard 316k / 160k divider
+#else
+  // XIAO nRF52840 / Plus pin mapping
+  static constexpr int8_t LCD_RST_PIN   = 38;   // Raw GPIO on Plus
+  static constexpr int8_t LCD_BL_PIN    = 37;
+  static constexpr uint8_t READ_BAT_P0_PIN = 14;// Active-low divider enable
+  static constexpr uint8_t CHG_P0_PIN      = 17;// Active-low charging detect
+  #ifndef PIN_VBAT
+  #define PIN_VBAT 35
+  #endif
+#endif
+
+// Buttons are identical across both XIAO boards
 static constexpr uint8_t PIN_BTN_JUMP  = D6; // USR1: Action / Select / Down
 static constexpr uint8_t PIN_BTN_RESET = D7; // USR2: Toggle / Up
-
-// Battery measurement pins (onboard XIAO nRF52840 circuit)
-static constexpr uint8_t READ_BAT_P0_PIN = 14; // P0.14: Active-low divider enable
-static constexpr uint8_t CHG_P0_PIN      = 17; // P0.17: Active-low charging detect
-#ifndef PIN_VBAT
-#define PIN_VBAT 35
-#endif
 
 // ── Geometry (Landscape 160x80) ───────────────────────────────────────────
 static constexpr int16_t SCREEN_W       = 160;
@@ -91,7 +106,6 @@ static constexpr uint16_t C_PURPLE         = 0x915F; // Spooky twilight purple
 static constexpr uint16_t C_RED            = 0xF800; // Crimson red
 
 // ── Full-Screen Sunset Sky Gradient for Runner (All 80 rows: Dusk Blue -> Pink -> Orange -> Amber)
-// Eliminates the black bar completely!
 static const uint16_t SUNSET_SKY[80] = {
   0x10CB, 0x10CB, 0x10CB, 0x10CB, 0x10CB, 0x10CB, 0x10CB, 0x18CB,
   0x18CC, 0x18CC, 0x18CC, 0x18CC, 0x18EC, 0x18EC, 0x20EC, 0x20ED,
@@ -203,40 +217,64 @@ static inline void renderPongBackground() {
   }
 }
 
-// ── Persistent Multi-Game Flash Storage (LittleFS) ────────────────────────
+// ── Persistent Multi-Game Flash Storage ────────────────────────────────────
 struct GameSaveData {
   uint32_t runnerHighScore;
   uint32_t pongWins;
 };
 
-static const char* SAVE_FILE = "/keychain_arcade.dat";
 static GameSaveData g_saveData = { 0, 0 };
 static bool g_newRecordThisRun = false;
 
-static void loadGameSave() {
-  if (!InternalFS.begin()) {
-    InternalFS.format();
-    InternalFS.begin();
-  }
-  File f(InternalFS);
-  if (f.open(SAVE_FILE, FILE_O_READ)) {
-    f.read((uint8_t*)&g_saveData, sizeof(g_saveData));
-    f.close();
-  } else {
-    g_saveData.runnerHighScore = 0;
-    g_saveData.pongWins        = 0;
-  }
-}
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  static Preferences g_prefs;
 
-static void saveGameSave() {
-  if (!InternalFS.begin()) return;
-  InternalFS.remove(SAVE_FILE);
-  File f(InternalFS);
-  if (f.open(SAVE_FILE, FILE_O_WRITE)) {
-    f.write((uint8_t*)&g_saveData, sizeof(g_saveData));
-    f.close();
+  static void loadGameSave() {
+    if (g_prefs.begin("keychain", true)) {
+      g_saveData.runnerHighScore = g_prefs.getUInt("runnerHS", 0);
+      g_saveData.pongWins        = g_prefs.getUInt("pongWins", 0);
+      g_prefs.end();
+    } else {
+      g_saveData.runnerHighScore = 0;
+      g_saveData.pongWins        = 0;
+    }
   }
-}
+
+  static void saveGameSave() {
+    if (g_prefs.begin("keychain", false)) {
+      g_prefs.putUInt("runnerHS", g_saveData.runnerHighScore);
+      g_prefs.putUInt("pongWins", g_saveData.pongWins);
+      g_prefs.end();
+    }
+  }
+#else
+  static const char* SAVE_FILE = "/keychain_arcade.dat";
+
+  static void loadGameSave() {
+    if (!InternalFS.begin()) {
+      InternalFS.format();
+      InternalFS.begin();
+    }
+    File f(InternalFS);
+    if (f.open(SAVE_FILE, FILE_O_READ)) {
+      f.read((uint8_t*)&g_saveData, sizeof(g_saveData));
+      f.close();
+    } else {
+      g_saveData.runnerHighScore = 0;
+      g_saveData.pongWins        = 0;
+    }
+  }
+
+  static void saveGameSave() {
+    if (!InternalFS.begin()) return;
+    InternalFS.remove(SAVE_FILE);
+    File f(InternalFS);
+    if (f.open(SAVE_FILE, FILE_O_WRITE)) {
+      f.write((uint8_t*)&g_saveData, sizeof(g_saveData));
+      f.close();
+    }
+  }
+#endif
 
 // ── Battery Monitoring (Non-blocking) ─────────────────────────────────────
 static int  g_batPercent    = 100;
@@ -245,6 +283,24 @@ static bool g_usbConnected  = false;
 static uint32_t g_lastBatCheckMs = 0;
 
 static void updateBatteryStatus() {
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  // ESP32-S3 Plus: 316k / 160k divider ratio = (316 + 160) / 160 ≈ 2.975
+  uint32_t sumMv = 0;
+  for (int i = 0; i < 8; ++i) {
+    sumMv += analogReadMilliVolts(PIN_BAT_ADC);
+    delayMicroseconds(50);
+  }
+  float vdiv = (sumMv / 8.0f) / 1000.0f;
+  float vbat = vdiv * 2.975f;
+
+  int pct = (int)((vbat - 3.20f) * 100.0f / (4.15f - 3.20f));
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  g_batPercent = pct;
+  g_isCharging = false;
+  g_usbConnected = false;
+#else
+  // nRF52840 Plus: Active-low divider on P0.14
   NRF_P0->OUTCLR = (1UL << READ_BAT_P0_PIN);
   NRF_P0->DIRSET = (1UL << READ_BAT_P0_PIN);
   delayMicroseconds(200);
@@ -267,6 +323,7 @@ static void updateBatteryStatus() {
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   g_batPercent = pct;
+#endif
 }
 
 static void renderBatteryIcon(int16_t x, int16_t y) {
@@ -956,6 +1013,11 @@ static void renderBootScreen(uint32_t elapsedMs) {
   canvas.setTextColor(C_GOLD);
   canvas.drawCentreString("ARCADE", 80, 19, 1);
 
+  canvas.setTextSize(1);
+  canvas.setTextColor(C_BLACK);
+  canvas.drawCentreString("PRESS D6 TO START", 81, 69, 1);
+  canvas.setTextColor(C_WHITE);
+  canvas.drawCentreString("PRESS D6 TO START", 80, 68, 1);
 
   flushCanvasFast();
 }
@@ -985,7 +1047,10 @@ static void renderGameMenuScreen() {
     canvas.pushImage(94, 38, 14, 14, SPRITE_PUMPKIN, C_TRANS);
 
     // Subtitle
-
+    canvas.setTextColor(C_BLACK);
+    canvas.drawCentreString("SUNSET SKY RUN", 81, 55, 1);
+    canvas.setTextColor(0xD69A);
+    canvas.drawCentreString("SUNSET SKY RUN", 80, 54, 1);
   } else {
     // Pong: Showcase Dark Moody Graveyard
     renderPongBackground();
@@ -1013,11 +1078,17 @@ static void renderGameMenuScreen() {
     canvas.pushImage(118, 32 - paddleBob, PONG_PADDLE_W, PONG_PADDLE_H, SPRITE_BONE_USER, C_TRANS);
 
     // Subtitle
-
+    canvas.setTextColor(C_BLACK);
+    canvas.drawCentreString("DARK GRAVEYARD PONG", 81, 55, 1);
+    canvas.setTextColor(0xD69A);
+    canvas.drawCentreString("DARK GRAVEYARD PONG", 80, 54, 1);
   }
 
   // Navigation hint floating at bottom
-
+  canvas.setTextColor(C_BLACK);
+  canvas.drawCentreString("D7: NEXT   D6: PLAY", 81, 69, 1);
+  canvas.setTextColor(C_WHITE);
+  canvas.drawCentreString("D7: NEXT   D6: PLAY", 80, 68, 1);
 
   renderBatteryIcon(144, 69);
   flushCanvasFast();
@@ -1094,7 +1165,10 @@ static void renderGameOverScreen() {
   }
 
   // Bottom action hint with shadow
-
+  canvas.setTextColor(C_BLACK);
+  canvas.drawCentreString("D6: RETRY   D7: MENU", 81, 69, 1);
+  canvas.setTextColor(0xD69A);
+  canvas.drawCentreString("D6: RETRY   D7: MENU", 80, 68, 1);
 
   renderBatteryIcon(144, 69);
   flushCanvasFast();
@@ -1113,9 +1187,14 @@ void setup() {
   digitalWrite(LCD_BL_PIN, HIGH);
 
   // Battery ADC configuration
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BAT_ADC, ADC_11db);
+#else
   nrf_gpio_cfg_input(CHG_P0_PIN, NRF_GPIO_PIN_PULLUP);
   analogReadResolution(12);
   NRF_P0->DIRCLR = (1UL << READ_BAT_P0_PIN);
+#endif
 
   // Load persistent save data
   loadGameSave();
